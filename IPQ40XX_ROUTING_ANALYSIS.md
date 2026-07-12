@@ -162,6 +162,14 @@ ethtool -X eth0 equal 3
 ethtool -K eth0 rxhash off
 ```
 
+### Kernel patch 723: complete fixed-queue reporting
+
+`723-net-qualcomm-ipqess-complete-fixed-queue-ethtool-reporting.patch` reports
+the fixed four RX rings through the Linux 6.18 `get_rx_ring_count` callback.
+The legacy ethtool ioctl uses that callback to validate RSS indirection-table
+updates, so it is required for the image's `ethtool -X eth0 equal 3` command.
+It also reports four RX/TX channels and the current 128-descriptor ring sizes.
+
 ### OpenWrt policy
 
 The Gale first-boot defaults now enable:
@@ -248,8 +256,11 @@ found. `fast-classifier.ko` is installed but no OEM init job loads it.
 ## Validation and benchmark plan
 
 The patches were applied through the complete OpenWrt Linux 6.18.38 target
-prepare step. Both modified IPQESS translation units also compile with an ARM
-cross-compiler. Runtime validation still requires the device.
+prepare step and compiled with the ARM cross-compiler. Gale runtime diagnostics
+confirmed the four Ethernet TX queues, XPS/RPS masks, RFS sizing, interrupt
+moderation, non-threaded NAPI, and exact EDMA/ath10k IRQ affinity. They also
+identified the missing RX-ring-count callback fixed by patch 723; that final
+RSS programming path requires validation with the rebuilt image.
 
 On Gale, verify:
 

@@ -1,0 +1,54 @@
+From: OpenWrt IPQ40xx maintainers <openwrt-devel@lists.openwrt.org>
+Date: Sun, 12 Jul 2026 00:00:00 +0000
+Subject: [PATCH] net: qualcomm: ipqess: complete fixed queue ethtool reporting
+
+The legacy ethtool ioctl implementation queries ETHTOOL_GRXRINGS before it
+programs an RSS indirection table.  IPQESS provides the RSS callbacks, but
+does not answer it, so `ethtool -X` fails before set_rxfh is reached.
+
+Report the fixed four receive rings through get_rx_ring_count.  Also expose
+the fixed four receive and transmit channels and report the current ring
+sizes.  This makes the ioctl and netlink ethtool views agree with the
+hardware configuration.
+
+Signed-off-by: OpenWrt IPQ40xx maintainers <openwrt-devel@lists.openwrt.org>
+---
+ drivers/net/ethernet/qualcomm/ipqess/ipqess_ethtool.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+--- a/drivers/net/ethernet/qualcomm/ipqess/ipqess_ethtool.c
++++ b/drivers/net/ethernet/qualcomm/ipqess/ipqess_ethtool.c
+@@ -146,8 +146,24 @@ static void ipqess_get_ringparam(struct
+ {
+ 	ring->tx_max_pending = IPQESS_TX_RING_SIZE;
+ 	ring->rx_max_pending = IPQESS_RX_RING_SIZE;
++	ring->tx_pending = IPQESS_TX_RING_SIZE;
++	ring->rx_pending = IPQESS_RX_RING_SIZE;
+ }
+ 
++static void ipqess_get_channels(struct net_device *netdev,
++				struct ethtool_channels *channels)
++{
++	channels->max_rx = IPQESS_NETDEV_QUEUES;
++	channels->max_tx = IPQESS_NETDEV_QUEUES;
++	channels->rx_count = IPQESS_NETDEV_QUEUES;
++	channels->tx_count = IPQESS_NETDEV_QUEUES;
++}
++
++static u32 ipqess_get_rx_ring_count(struct net_device *netdev)
++{
++	return IPQESS_NETDEV_QUEUES;
++}
++
+ static u32 ipqess_get_rxfh_indir_size(struct net_device *netdev)
+ {
+ 	return IPQESS_RSS_IDT_SIZE;
+@@ -262,6 +278,8 @@ static const struct ethtool_ops ipqessto
+ 	.supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
+ 				     ETHTOOL_COALESCE_TX_USECS,
++	.get_channels = ipqess_get_channels,
++	.get_rx_ring_count = ipqess_get_rx_ring_count,
+ 	.get_rxfh_indir_size = ipqess_get_rxfh_indir_size,
+ 	.get_rxfh = ipqess_get_rxfh,
+ 	.set_rxfh = ipqess_set_rxfh,
+ 	.get_drvinfo = &ipqess_get_drvinfo,
