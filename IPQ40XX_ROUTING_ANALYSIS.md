@@ -216,6 +216,35 @@ separately.
 - RX page-mode code from Linux 3.18: the correct modern follow-up is a measured
   page-pool conversion, not a verbatim port.
 
+## Broader OEM networking binary audit
+
+The extracted root filesystem contains one additional Google-authored kernel
+networking component that is not a forwarding accelerator:
+
+- `lib/modules/3.18.0-20714-gcb1966e3e030/kernel/net/sched/sch_arl.ko` is
+  Google's Adaptive Rate Limiting qdisc. Symbols such as
+  `arl_sample_latency_ingress`, `arl_update_hrtt`, and `arl_apply_new_rate`
+  show that it adjusts a shaped rate from TCP/conntrack latency measurements.
+- `/usr/sbin/ap-qos-monitor` enables ARL by default and combines it with IFB,
+  HTB, priority qdiscs, FQ-CoDel, and NFQUEUE. Its embedded defaults include a
+  60 percent minimum-rate ratio, a 100 ms latency threshold, and 25 ms
+  hysteresis.
+
+ARL is a bufferbloat/QoS feature, not part of Gale's SFE routing fast path. A
+modern OpenWrt implementation should build an adaptive controller around CAKE
+rather than forward-porting the Linux 3.18 qdisc and its direct TCP internals.
+
+The OEM ath10k/mac80211 modules also contain custom airtime-fairness, per-TID
+FQ-CoDel, queue-limit, aggregation, bursting, RTS, and latency-statistics
+controls. Modern OpenWrt mac80211 already provides newer airtime scheduling,
+FQ-CoDel, and AQL, but Google's exact optional per-TID/Stadia policy is not
+reproduced by these routing patches.
+
+Other audited behavior includes SFE bypass/flush coordination while QoS is
+active, multicast-to-unicast policy, and a shorter established conntrack
+timeout. No hidden NSS, ECM, PPE, or other hardware routed-flow driver was
+found. `fast-classifier.ko` is installed but no OEM init job loads it.
+
 ## Validation and benchmark plan
 
 The patches were applied through the complete OpenWrt Linux 6.18.38 target
@@ -230,6 +259,13 @@ ethtool -c eth0
 ethtool -x eth0
 ethtool -S eth0
 ls -l /sys/class/net/eth0/queues
+cat /sys/class/net/eth0/threaded
+for dev in eth0 lan wan; do
+	for q in /sys/class/net/$dev/queues/tx-*; do
+		printf '%s: ' "$q"
+		cat "$q/xps_cpus"
+	done
+done
 cat /proc/interrupts
 cat /proc/softirqs
 cat /proc/sys/net/core/rps_sock_flow_entries
