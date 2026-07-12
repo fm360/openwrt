@@ -37,6 +37,6 @@ define Device/google_wifi
 	# kmod-ramoops.
 	DEVICE_PACKAGES := partx-utils mkf2fs e2fsprogs \
 			   kmod-fs-ext4 kmod-fs-f2fs kmod-google-firmware \
-			   kmod-ramoops
+			   kmod-ramoops ethtool
 endef
 TARGET_DEVICES += google_wifi

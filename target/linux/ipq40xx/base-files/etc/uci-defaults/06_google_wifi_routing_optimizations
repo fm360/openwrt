@@ -1,0 +1,23 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = "google,wifi" ] || exit 0
+
+# Gale's stock firmware uses Qualcomm SFE, which is a software flow cache.
+# OpenWrt's maintained equivalent is the nftables software flowtable.
+uci -q set firewall.@defaults[0].flow_offloading='1'
+# IPQ4019 has no supported netfilter/NSS hardware NAT backend in this tree.
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+uci -q commit firewall
+
+# Spread protocol processing over the four Cortex-A7 CPUs.  The IPQESS driver
+# already exposes four RX/TX queues and uses threaded NAPI.
+uci -q get network.globals.packet_steering >/dev/null || \
+	uci -q set network.globals='globals'
+uci -q set network.globals.packet_steering='1'
+uci -q set network.globals.steering_flows='256'
+uci -q commit network
+
+exit 0

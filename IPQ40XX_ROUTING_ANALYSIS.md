@@ -1,0 +1,252 @@
+# Google Wifi Gale / IPQ4019 routing acceleration analysis
+
+## Conclusion
+
+The stock Gale image does not use an NSS, ECM, or PPE hardware NAT/routing
+engine. Its routed-flow accelerator is Qualcomm Shortcut Forwarding Engine
+(SFE), a software fast path running on the four Cortex-A7 CPUs. Hardware helps
+around that fast path through the ESS switch and EDMA controller:
+
+- L2 switching, VLAN handling, and port forwarding in the ESS switch
+- EDMA descriptor processing, four receive/transmit netdev queues, RSS,
+  checksum offload, VLAN offload, scatter/gather, TSO, and GRO
+- Deliberate IRQ, RSS, RPS, RFS, and XPS placement across the CPUs
+
+The maintained OpenWrt replacement for the SFE routed fast path is nftables
+`nf_flow_table` software offload. Setting `flow_offloading_hw=1` does not add
+hardware NAT on IPQ4019 because this tree has no IPQ4019 flow-offload driver
+callback.
+
+## Stock fast-path architecture
+
+The stock image contains these matching Linux 3.18 modules:
+
+```text
+shortcut-fe.ko
+shortcut-fe-ipv6.ko
+shortcut-fe-cm.ko
+fast-classifier.ko
+essedma.ko
+```
+
+`/etc/init/load-sfe-module.conf` unconditionally loads `shortcut-fe-cm`.
+`/etc/init/traffic-acceleration.conf` enables it through `/sys/sfe_cm/stop`
+and flushes cached rules through `/sys/sfe_cm/defunct_all`.
+
+The first packet follows the normal path:
+
+```text
+EDMA RX -> Linux receive stack -> firewall/conntrack/NAT/routing
+        -> SFE post-routing hook -> install translated two-way flow rule
+```
+
+Later packets follow this path when the cached rule is eligible:
+
+```text
+EDMA RX -> __netif_receive_skb_core() -> fast_nat_recv
+        -> sfe_cm_recv() -> sfe_ipv4_recv()/sfe_ipv6_recv()
+        -> rewrite L2/L3/L4 headers and checksums -> dev_queue_xmit()
+```
+
+The Chromium 3.18 kernel adds the global `fast_nat_recv` callback before
+VLAN receive handling, bridge receive handlers, protocol dispatch, routing,
+and netfilter. `shortcut-fe-cm` assigns `sfe_cm_recv` to that callback. This
+placement is why SFE saves so much per-packet CPU time; it is also why the old
+hook is unsafe to transplant unchanged into a modern observable nftables/DSA
+stack.
+
+SFE only installs confirmed, eligible TCP/UDP flows. It rejects helpers/ALGs,
+non-established TCP, local output, broadcast/multicast, and flows lacking
+valid devices, routes, neighbours, or translation state. It synchronizes
+counters and TCP state back to conntrack and removes cached rules on device or
+conntrack events.
+
+Primary source references:
+
+- [ChromeOS 3.18 receive path](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/net/core/dev.c)
+- [ChromeOS SFE connection manager](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/drivers/net/ethernet/qualcomm/sfe/shortcut-fe/sfe_cm.c)
+- [ChromeOS SFE IPv4 engine](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/drivers/net/ethernet/qualcomm/sfe/shortcut-fe/sfe_ipv4.c)
+- [ChromeOS ESS EDMA driver](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/drivers/net/ethernet/qualcomm/essedma/edma.c)
+
+## Why this is not routed hardware offload
+
+There are no `qca-nss-drv`, `qca-nss-ecm`, PPE, or hardware-NAT modules in the
+root filesystem. SFE imports ordinary kernel routing, conntrack, and transmit
+functions; its fast engines rewrite packets in ARM code and call
+`dev_queue_xmit()`. They do not import an NSS firmware or PPE rule API.
+
+The stock hardware features have narrower scopes:
+
+| Mechanism | Scope | Present |
+|---|---|---|
+| ESS switch | L2 FDB/VLAN/port switching | Yes |
+| ESS EDMA | DMA, RSS, checksum/VLAN offload, SG/TSO/GRO | Yes |
+| SFE | CPU software routed/NAT flow cache | Yes |
+| EDMA aRFS | Per-flow CPU steering through a switch callback | Driver code exists, but no registering backend was found |
+| NSS/ECM/PPE | Hardware routed/NAT flow engine | No |
+
+The stock settings framework also disables hardware AQM unless
+`PLATFORM_HAS_NSS_SUPPORT=1`; Gale does not set that capability.
+
+## Stock multicore tuning
+
+`/etc/init/gale-platform.conf` supplies most of the non-SFE performance gain:
+
+- EDMA RX interrupts are assigned one per CPU.
+- Four exposed TX queues use XPS masks `1`, `2`, `4`, and `8`.
+- Each RX queue receives 256 RFS entries; the global table has 1024 entries.
+- GRO is enabled.
+- All 128 RSS entries are reprogrammed to use three RX queues, reserving CPU3
+  for the 5 GHz radio.
+- WAN RPS masks rotate through CPUs 1, 2, and 0; LAN masks rotate through CPUs
+  2, 0, and 1.
+- Hardware RX hash publication is then disabled so software RPS computes the
+  hash used for the cross-CPU handoff.
+- Wi-Fi IRQ and RPS placement deliberately separates radio interrupt work from
+  later packet processing.
+
+The EDMA interrupt moderation register uses two-microsecond ticks. Stock
+defaults are 64 microseconds for RX (`0x20`) and 160 microseconds for TX
+(`0x50`).
+
+## Existing OpenWrt implementation
+
+This clone uses Linux 6.18.38 and already has a modern IPQESS plus QCA8K DSA
+stack. It provides:
+
+- Four RX and four TX netdev queues
+- RSS over hardware rings 0, 2, 4, and 6
+- Threaded NAPI and `napi_gro_receive()`
+- BQL, RX/TX checksums, VLAN acceleration, SG, TSO, and GRO
+- DSA hardware offload for L2 FDB, VLAN, bridge, MDB, mirroring, and LAG
+- `kmod-nft-offload` for maintained software routed-flow acceleration
+
+It does not provide NSS/ECM, SFE, a PPE backend, `ndo_flow_offload`, or a QCA8K
+TC flower/flow-block callback. Hardware flowtable mode must therefore remain
+disabled.
+
+## Implemented changes
+
+### Kernel patch 720: configurable interrupt moderation
+
+`720-net-qualcomm-ipqess-add-ethtool-coalescing-support.patch` exposes the
+EDMA RX/TX timers through the standard ethtool coalescing API. It retains the
+stock-derived defaults while allowing measurements to trade interrupt cost
+against latency.
+
+```sh
+ethtool -c eth0
+ethtool -C eth0 rx-usecs 64 tx-usecs 160
+```
+
+### Kernel patch 721: RSS control and RX hash publication
+
+`721-net-qualcomm-ipqess-add-RSS-ethtool-controls.patch` restores two vendor
+capabilities missing from the current IPQESS driver:
+
+- Publish the EDMA descriptor hash with `skb_set_hash()` when RXHASH is on.
+- Get/set the 128-entry RSS indirection table with standard ethtool APIs.
+
+The driver translates netdev queues 0-3 to EDMA hardware rings 0, 2, 4, and 6.
+No private procfs ABI is introduced.
+
+```sh
+ethtool -x eth0
+ethtool -X eth0 equal 4
+
+# Stock-style three-queue distribution. The Google Wifi image applies this
+# automatically to the IPQESS master and reapplies it after network events.
+ethtool -X eth0 equal 3
+
+# Use software-computed hashes when deliberately reproducing stock RPS.
+ethtool -K eth0 rxhash off
+```
+
+### OpenWrt policy
+
+The Gale first-boot defaults now enable:
+
+```text
+firewall flow_offloading=1
+firewall flow_offloading_hw=0
+network packet_steering=1
+256 RFS entries per RX queue
+1024 global RFS entries
+```
+
+The Google Wifi image includes `ethtool` for RSS and coalescing inspection.
+Its platform packet-steering helper identifies the IPQESS master by its
+ethtool driver name and automatically distributes all RSS buckets over queues
+0-2, leaving queue 3 out of the hardware receive distribution as on stock
+Gale. It then applies the coordinated stock policy:
+
+- non-threaded IPQESS NAPI so IRQ affinity also controls the poll CPU
+- active EDMA TX IRQ masks `4,4,1,2` and RX IRQ masks `1,2,4,8`
+- Ethernet XPS masks `1,2,4,8` and 256 RFS entries per receive queue
+- direction-neutral DSA-master RPS masks `6,5,3,6`
+- 2.4 GHz IRQ/RPS masks `1/8` and 5 GHz IRQ/RPS masks `8/7`
+
+Patch 722 gives the DSA `lan` and `wan` devices four software TX queues so
+the same XPS mapping can be retained through the DSA user device and IPQESS
+conduit. This feeds all four EDMA DMA rings; it does not add switch egress
+hardware QoS.
+
+Stock could select different LAN and WAN RPS CPUs because it exposed two EDMA
+netdevs. Modern DSA performs RPS on the shared IPQESS master before port demux,
+so the helper uses the union of Google's LAN and WAN masks. This preserves the
+CPU-avoidance policy but cannot be a bit-for-bit per-port reproduction.
+
+Do not combine software flow offload with SQM/CAKE when accurate shaping is
+required. Like stock SFE, a fast path avoids work that a shaper expects to see.
+Disable `flow_offloading` before enabling SQM and benchmark that configuration
+separately.
+
+## Deliberately not ported
+
+- The Linux 3.18 `fast_nat_recv` hook: modern nftables flowtable already
+  supplies a maintained fast path without an unrestricted global callback.
+- SFE itself: it would duplicate `nf_flow_table` and recreate old bridge,
+  netfilter, QoS, and observability hazards.
+- EDMA `ndo_rx_flow_steer`: the old code cannot program hardware until a
+  separate ESS switch component registers a proprietary rule callback. No
+  active backend was found in Gale.
+- NSS/ECM/PPE hardware NAT: no matching Gale firmware/control plane exists,
+  and the current DSA/netfilter integration would be a separate experimental
+  project rather than a small EDMA patch.
+- RX page-mode code from Linux 3.18: the correct modern follow-up is a measured
+  page-pool conversion, not a verbatim port.
+
+## Validation and benchmark plan
+
+The patches were applied through the complete OpenWrt Linux 6.18.38 target
+prepare step. Both modified IPQESS translation units also compile with an ARM
+cross-compiler. Runtime validation still requires the device.
+
+On Gale, verify:
+
+```sh
+ethtool -k eth0
+ethtool -c eth0
+ethtool -x eth0
+ethtool -S eth0
+ls -l /sys/class/net/eth0/queues
+cat /proc/interrupts
+cat /proc/softirqs
+cat /proc/sys/net/core/rps_sock_flow_entries
+uci show firewall | grep flow_offloading
+nft list ruleset | grep -A8 -B2 flowtable
+```
+
+Benchmark bidirectional IPv4 NAT, IPv6 routing, LAN-to-WLAN bridging, and
+small-packet PPS. Compare software flow offload on/off, record per-CPU softirq
+load, EDMA queue counters, drops, latency under load, and conntrack state. Tune
+coalescing only from measured results.
+
+## Gale v1 device-tree warning
+
+The current OpenWrt device profile identifies `google,gale-v2`. The repository
+root's extracted v1 DTS identifies `google,gale` and has materially different
+GPIO assignments, including write-protect, recovery, and 802.15.4 reset pins.
+The Ethernet PHY/port mapping is consistent, but these routing patches do not
+make the v2 board file safe for v1 hardware. Create and validate a separate v1
+DTS/device profile before flashing a unit that truly uses the v1 board wiring.

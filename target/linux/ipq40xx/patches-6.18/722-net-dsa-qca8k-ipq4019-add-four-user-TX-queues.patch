@@ -1,0 +1,29 @@
+From: OpenWrt Gale optimization work <noreply@example.com>
+Date: Sun, 12 Jul 2026 00:00:00 +0000
+Subject: [PATCH] net: dsa: qca8k: ipq4019: add four user TX queues
+
+IPQESS exposes four netdev TX queues backed by hardware rings 0, 4, 8 and
+12.  The IPQ4019 DSA switch currently leaves num_tx_queues unset, making
+DSA allocate only one queue for each user port.  That collapses locally
+generated traffic onto queue zero before it reaches the IPQESS conduit and
+prevents per-CPU XPS from selecting all four DMA rings.
+
+Expose four queues on the IPQ4019 user ports.  The out-of-band tagger
+keeps the skb queue mapping intact, so identical XPS maps on the DSA user
+port and IPQESS conduit preserve the selected queue through the second
+transmit.
+
+Signed-off-by: OpenWrt Gale optimization work <noreply@example.com>
+---
+ drivers/net/dsa/qca/qca8k-ipq4019.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/net/dsa/qca/qca8k-ipq4019.c
++++ b/drivers/net/dsa/qca/qca8k-ipq4019.c
+@@ -912,5 +912,6 @@ qca8k_ipq4019_probe(struct platform_devi
+ 	priv->ds->dev = dev;
+ 	priv->ds->num_ports = QCA8K_IPQ4019_NUM_PORTS;
++	priv->ds->num_tx_queues = 4;
+ 	priv->ds->priv = priv;
+ 	priv->ds->ops = &qca8k_ipq4019_switch_ops;
+ 	priv->ds->phylink_mac_ops = &qca8k_ipq4019_phylink_mac_ops;
