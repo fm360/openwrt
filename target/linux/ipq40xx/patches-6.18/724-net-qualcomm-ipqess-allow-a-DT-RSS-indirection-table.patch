@@ -1,0 +1,106 @@
+From: OpenWrt Gale optimization work <noreply@example.com>
+Date: Sun, 12 Jul 2026 00:00:00 +0000
+Subject: [PATCH] net: qualcomm: ipqess: allow a DT RSS indirection table
+
+The Gale OEM policy writes a board-specific 16-register RSS indirection
+table after the EDMA driver starts.  Its ordering is not the same as the
+generic equal-three-queue table, although both exclude the fourth RX queue.
+
+Let boards provide packed register values in qcom,rss-idt.  Require 16
+registers.  Every nibble must select a valid even EDMA RX ring ID.  Devices
+without the property retain the existing four-queue default.
+
+Signed-off-by: OpenWrt Gale optimization work <noreply@example.com>
+---
+ drivers/net/ethernet/qualcomm/ipqess/ipqess.c | 55 ++++++++++++++++++++++++---
+ drivers/net/ethernet/qualcomm/ipqess/ipqess.h |  1 +
+ 2 files changed, 51 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/qualcomm/ipqess/ipqess.h
++++ b/drivers/net/ethernet/qualcomm/ipqess/ipqess.h
+@@ -379,6 +379,7 @@ void ipqess_update_hw_stats(struct ipqes
+ #define IPQESS_RSS_IDT_ENTRIES_PER_REG 8
+ #define IPQESS_RSS_IDT_ENTRY_BITS 4
+ #define IPQESS_RSS_IDT_SIZE (IPQESS_NUM_IDT * IPQESS_RSS_IDT_ENTRIES_PER_REG)
++#define IPQESS_RSS_IDT_ENTRY_MASK GENMASK(IPQESS_RSS_IDT_ENTRY_BITS - 1, 0)
+ 
+ /* Default RSS Ring Register */
+ #define IPQESS_REG_DEF_RSS 0x890
+--- a/drivers/net/ethernet/qualcomm/ipqess/ipqess.c
++++ b/drivers/net/ethernet/qualcomm/ipqess/ipqess.c
+@@ -1029,11 +1029,59 @@ static void ipqess_hw_stop(struct ipqess
+ 	ipqess_m32(ess, IPQESS_TXQ_CTRL_TXQ_EN, 0, IPQESS_REG_TXQ_CTRL);
+ }
+ 
++static int ipqess_read_rss_idt(struct ipqess *ess, u32 *rss_idt)
++{
++	struct device_node *np = ess->pdev->dev.of_node;
++	int count, err, i, j;
++
++	if (!of_find_property(np, "qcom,rss-idt", NULL)) {
++		for (i = 0; i < IPQESS_NUM_IDT; i++)
++			rss_idt[i] = IPQESS_RSS_IDT_VALUE;
++
++		return 0;
++	}
++
++	count = of_property_count_u32_elems(np, "qcom,rss-idt");
++	if (count != IPQESS_NUM_IDT) {
++		dev_err(&ess->pdev->dev,
++			"qcom,rss-idt must contain %d registers, got %d\n",
++			IPQESS_NUM_IDT, count);
++		return -EINVAL;
++	}
++
++	err = of_property_read_u32_array(np, "qcom,rss-idt", rss_idt,
++					 IPQESS_NUM_IDT);
++	if (err)
++		return err;
++
++	for (i = 0; i < IPQESS_NUM_IDT; i++) {
++		for (j = 0; j < IPQESS_RSS_IDT_ENTRIES_PER_REG; j++) {
++			u32 ring = (rss_idt[i] >>
++				    (j * IPQESS_RSS_IDT_ENTRY_BITS)) &
++				   IPQESS_RSS_IDT_ENTRY_MASK;
++
++			if ((ring & 1) || ring >= IPQESS_NETDEV_QUEUES * 2) {
++				dev_err(&ess->pdev->dev,
++					"invalid RSS ring %u in qcom,rss-idt\n",
++					ring);
++				return -EINVAL;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static int ipqess_hw_init(struct ipqess *ess)
+ {
+ 	int i, err;
++	u32 rss_idt[IPQESS_NUM_IDT];
+ 	u32 tmp;
+ 
++	err = ipqess_read_rss_idt(ess, rss_idt);
++	if (err)
++		return err;
++
+ 	ipqess_hw_stop(ess);
+ 
+ 	ipqess_m32(ess, BIT(IPQESS_INTR_SW_IDX_W_TYP_SHIFT),
+@@ -1088,13 +1136,10 @@ static int ipqess_hw_init(struct ipqess
+ 	/* Disable TX FIFO low watermark and high watermark */
+ 	ipqess_w32(ess, IPQESS_REG_TXF_WATER_MARK, 0);
+ 
+-	/* Configure RSS indirection table.
+-	 * 128 hash will be configured in the following
+-	 * pattern: hash{0,1,2,3} = {Q0,Q2,Q4,Q6} respectively
+-	 * and so on
++	/* Configure the default or board-specific RSS indirection table.
+ 	 */
+ 	for (i = 0; i < IPQESS_NUM_IDT; i++)
+-		ipqess_w32(ess, IPQESS_REG_RSS_IDT(i), IPQESS_RSS_IDT_VALUE);
++		ipqess_w32(ess, IPQESS_REG_RSS_IDT(i), rss_idt[i]);
+ 
+ 	/* Configure load balance mapping table.
+ 	 * 4 table entry will be configured according to the

@@ -17,6 +17,32 @@ The maintained OpenWrt replacement for the SFE routed fast path is nftables
 hardware NAT on IPQ4019 because this tree has no IPQ4019 flow-offload driver
 callback.
 
+## Evidence and provenance
+
+The main authorities for this port are the exact Gale firmware artifacts:
+
+- OEM kernel input `vmlinux_raw.bin`, SHA-256
+  `4ac3518ecdbcf4ca28b347f85915c0eb8a93da490ecc202ffa551bf859e640a9`
+- reconstructed kernel ELF, SHA-256
+  `c49ff06f427d3c323ea1ae5471f74d29eae7f9c6d73c14e16df0048ce2a1bae1`
+- unstripped OEM `essedma.ko`, SHA-256
+  `6fecb8a1f3407697afa38d869fe642ec60c2ba5b6d5df21206d9d99374b829a2`
+- the modules and configuration files under the extracted OEM root filesystem
+- FIT `fdt@8`, whose SHA-1 is
+  `fe50df4a1aa77a2076198156154a884a605fbe00`
+
+The FIT `kernel@1` extraction is byte-identical to `vmlinux_raw.bin`.
+`gale_v1.dts` is a byte-identical `dtc` round-trip of FIT `fdt@8`.
+
+The current `vmlinux-to-elf` output contains the correct OEM kernel bytes, but
+several recovered kallsyms names do not point to valid function boundaries.
+For example, the recovered `__netif_receive_skb_core` address lands on a return
+instruction. Therefore exact module disassembly and extracted Gale policy files
+are treated as binary-confirmed evidence; matching ChromiumOS source is used to
+explain kernel-core behavior that cannot yet be reliably named in the IDB.
+Modern ethtool, DSA, and nftables changes are explicitly classified as ports or
+adaptations rather than OEM code.
+
 ## Stock fast-path architecture
 
 The stock image contains these matching Linux 3.18 modules:
@@ -61,7 +87,7 @@ valid devices, routes, neighbours, or translation state. It synchronizes
 counters and TCP state back to conntrack and removes cached rules on device or
 conntrack events.
 
-Primary source references:
+Matching source references used to explain the binary-confirmed behavior:
 
 - [ChromeOS 3.18 receive path](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/net/core/dev.c)
 - [ChromeOS SFE connection manager](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/cb1966e3e030/drivers/net/ethernet/qualcomm/sfe/shortcut-fe/sfe_cm.c)
@@ -98,6 +124,8 @@ The stock settings framework also disables hardware AQM unless
 - GRO is enabled.
 - All 128 RSS entries are reprogrammed to use three RX queues, reserving CPU3
   for the 5 GHz radio.
+- The exact packed RSS registers repeat `0x42042042`, `0x20420420`, and
+  `0x40240240`, producing queue counts `42/43/43/0`.
 - WAN RPS masks rotate through CPUs 1, 2, and 0; LAN masks rotate through CPUs
   2, 0, and 1.
 - Hardware RX hash publication is then disabled so software RPS computes the
@@ -127,6 +155,16 @@ disabled.
 
 ## Implemented changes
 
+| OpenWrt change | Exact OEM authority | Classification |
+|---|---|---|
+| Patch 720 coalescing | `essedma.ko` writes `0x00500020`; its setters use two-microsecond ticks | Direct capability port |
+| Patch 721 RSS/hash API | `essedma.ko` publishes the descriptor hash and exposes private RSS sysctls | Modern ethtool API port |
+| Patch 722 four DSA TX queues | `gale-platform.conf` assigns four XPS queues to both OEM netdevs | DSA topology adaptation |
+| Patch 723 ring reporting | Linux 6.18 ethtool requirements and Gale runtime diagnostics | OpenWrt compatibility fix |
+| Patch 724 exact RSS table | `gale-platform.conf` raw RSS patterns | Direct policy port via DT |
+| nftables flow offload | `shortcut-fe*.ko` and `traffic-acceleration.conf` | Maintained functional substitute for SFE |
+| Shared-master RPS masks | Separate OEM LAN/WAN masks in `gale-platform.conf` | DSA topology adaptation |
+
 ### Kernel patch 720: configurable interrupt moderation
 
 `720-net-qualcomm-ipqess-add-ethtool-coalescing-support.patch` exposes the
@@ -154,8 +192,8 @@ No private procfs ABI is introduced.
 ethtool -x eth0
 ethtool -X eth0 equal 4
 
-# Stock-style three-queue distribution. The Google Wifi image applies this
-# automatically to the IPQESS master and reapplies it after network events.
+# Generic three-queue distribution for manual experiments. The Gale image
+# normally uses the exact OEM table supplied by its DTS instead.
 ethtool -X eth0 equal 3
 
 # Use software-computed hashes when deliberately reproducing stock RPS.
@@ -167,8 +205,17 @@ ethtool -K eth0 rxhash off
 `723-net-qualcomm-ipqess-complete-fixed-queue-ethtool-reporting.patch` reports
 the fixed four RX rings through the Linux 6.18 `get_rx_ring_count` callback.
 The legacy ethtool ioctl uses that callback to validate RSS indirection-table
-updates, so it is required for the image's `ethtool -X eth0 equal 3` command.
-It also reports four RX/TX channels and the current 128-descriptor ring sizes.
+updates, so it is required for manual `ethtool -X` adjustments. It also reports
+four RX/TX channels and the current 128-descriptor ring sizes.
+
+### Kernel patch 724: exact OEM RSS table
+
+`724-net-qualcomm-ipqess-allow-a-DT-RSS-indirection-table.patch` lets an
+IPQESS board supply the 16 packed RSS registers through `qcom,rss-idt`. The
+Google Wifi DTS contains the exact values written by OEM
+`/etc/init/gale-platform.conf`; the driver validates every ring selector before
+programming the hardware. Other IPQ40xx boards retain the standard four-queue
+table.
 
 ### OpenWrt policy
 
@@ -183,16 +230,18 @@ network packet_steering=1
 ```
 
 The Google Wifi image includes `ethtool` for RSS and coalescing inspection.
-Its platform packet-steering helper identifies the IPQESS master by its
-ethtool driver name and automatically distributes all RSS buckets over queues
-0-2, leaving queue 3 out of the hardware receive distribution as on stock
-Gale. It then applies the coordinated stock policy:
+The DTS programs the exact OEM RSS buckets over queues 0-2, leaving queue 3
+out of the hardware receive distribution as on stock Gale. Its platform
+packet-steering helper identifies the IPQESS master by its ethtool driver name
+and applies the coordinated stock policy:
 
 - non-threaded IPQESS NAPI so IRQ affinity also controls the poll CPU
 - active EDMA TX IRQ masks `4,4,1,2` and RX IRQ masks `1,2,4,8`
 - Ethernet XPS masks `1,2,4,8` and 256 RFS entries per receive queue
 - direction-neutral DSA-master RPS masks `6,5,3,6`
 - 2.4 GHz IRQ/RPS masks `1/8` and 5 GHz IRQ/RPS masks `8/7`
+- all XHCI interrupts on CPU2
+- RPS mask `1` for true 802.11s mesh interfaces on either radio
 
 Patch 722 gives the DSA `lan` and `wan` devices four software TX queues so
 the same XPS mapping can be retained through the DSA user device and IPQESS

@@ -442,6 +442,17 @@
 };
 
 &gmac {
+	/*
+	 * Exact Gale OEM RSS register sequence from gale-platform.conf. It
+	 * balances RX over rings 0, 2 and 4 while leaving ring 6/CPU3 free for
+	 * 5 GHz Wi-Fi work.
+	 */
+	qcom,rss-idt = <0x42042042 0x20420420 0x40240240
+			  0x42042042 0x20420420 0x40240240
+			  0x42042042 0x20420420 0x40240240
+			  0x42042042 0x20420420 0x40240240
+			  0x42042042 0x20420420 0x40240240
+			  0x42042042>;
 	status = "okay";
 };
 

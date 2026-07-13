@@ -3,9 +3,10 @@ Date: Sun, 12 Jul 2026 00:00:00 +0000
 Subject: [PATCH] net: qualcomm: ipqess: add RSS ethtool controls
 
 IPQ4019 EDMA has a 128-entry RSS indirection table and supplies a receive
-hash in its return descriptor.  The vendor driver exposed this hash and
-allowed table rebalancing.  The current driver instead uses a fixed
-four-queue table and discards the descriptor hash.
+hash in its return descriptor.  The vendor driver published this hash and
+allowed raw table rebalancing through private EDMA sysctls.  The current
+driver instead uses a fixed four-queue table and discards the descriptor
+hash.
 
 Report the receive hash when RXHASH is enabled and implement the standard
 ethtool RSS indirection callbacks.  EDMA queue IDs are even hardware ring

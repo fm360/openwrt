@@ -91,13 +91,10 @@ apply_ipqess_policy()
 		# dynamically numbered NAPI kthreads free to migrate onto CPU3.
 		write_value "$device_path/threaded" 0
 
-		# Distribute the 128 RSS buckets over queues 0-2. Queue 3 is kept
-		# out of Ethernet receive work so CPU3 remains available to radio
-		# processing. Hardware RSS remains active when RXHASH publication
-		# is disabled for software RPS.
-		/usr/sbin/ethtool -X "$device" equal 3 ||
-			logger -t google-wifi-steering -p daemon.err \
-				"failed to configure three-queue RSS on $device"
+		# The Gale DTS supplies the OEM's exact 128-bucket RSS table. Queue 3
+		# is kept out of Ethernet receive work so CPU3 remains available to
+		# radio processing. Hardware RSS remains active when RXHASH
+		# publication is disabled for software RPS.
 		/usr/sbin/ethtool -K "$device" gro on rxhash off ||
 			logger -t google-wifi-steering -p daemon.err \
 				"failed to configure offloads on $device"
@@ -136,7 +133,8 @@ apply_ipqess_policy()
 
 apply_wifi_rps()
 {
-	local device_path mask net_path net_phy phy_path phy_real radio_path
+	local device_path iface_mask iface_type mask net_path net_phy phy_path
+	local phy_real radio_path
 
 	for phy_path in /sys/class/ieee80211/phy*; do
 		[ -e "$phy_path/device" ] || continue
@@ -152,15 +150,24 @@ apply_wifi_rps()
 			[ -e "$net_path/phy80211" ] || continue
 			net_phy="$(readlink -f "$net_path/phy80211")"
 			[ "$net_phy" = "$phy_real" ] || continue
+			iface_mask="$mask"
+			iface_type="$(/usr/sbin/iw dev "${net_path##*/}" info \
+				2>/dev/null | sed -n 's/^[[:space:]]*type //p')"
+			# Gale assigns true 802.11s mesh interfaces to CPU0 for RPS,
+			# independently of the base radio's RPS mask.
+			[ "$iface_type" = "mesh point" ] && iface_mask=1
 
 			for device_path in "$net_path"/queues/rx-*; do
-				write_value "$device_path/rps_cpus" "$mask"
+				write_value "$device_path/rps_cpus" "$iface_mask"
 			done
 		done
 	done
 }
 
 apply_ipqess_policy
+
+# Stock Gale assigns every XHCI host interrupt to CPU2.
+set_irq_action_affinity "xhci-hcd:usb" 4
 
 # IPQ4019's GIC translates the DTS legacy SPIs 168/169 to hwirqs 200/201.
 # Put 2.4 GHz interrupt work on CPU0 and 5 GHz interrupt work on CPU3.
