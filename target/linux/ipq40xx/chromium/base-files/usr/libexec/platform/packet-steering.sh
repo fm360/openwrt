@@ -6,7 +6,16 @@ packet_steering="$1"
 steering_flows="$(uci -q get 'network.@globals[0].steering_flows')"
 opts=""
 
-[ "${steering_flows:-0}" -gt 0 ] && opts="-l $steering_flows"
+# The Gale placement below is this board's supported operating mode, so treat
+# a missing packet_steering option (e.g. a hand-written or restored network
+# config without the globals section) as enabled.  Only an explicit '0'
+# disables it.  Without this, every reload path - boot, procd triggers and the
+# hotplug reapply hooks - silently exits and the box degrades to whatever
+# packet-steering.uc last did, with all IRQs left on CPU0.
+[ -n "$packet_steering" ] || packet_steering=1
+
+[ "${steering_flows:-0}" -gt 0 ] || steering_flows=256
+opts="-l $steering_flows"
 
 # Retain OpenWrt's general steering for non-IPQESS devices, then override the
 # Gale-specific Ethernet and Wi-Fi placement below.
@@ -133,7 +142,7 @@ apply_ipqess_policy()
 
 apply_wifi_rps()
 {
-	local device_path iface_mask iface_type mask net_path net_phy phy_path
+	local device_path iface_mask mask net_path net_phy phy_path
 	local phy_real radio_path
 
 	for phy_path in /sys/class/ieee80211/phy*; do
@@ -150,12 +159,12 @@ apply_wifi_rps()
 			[ -e "$net_path/phy80211" ] || continue
 			net_phy="$(readlink -f "$net_path/phy80211")"
 			[ "$net_phy" = "$phy_real" ] || continue
+			# All interfaces on a radio share its RPS mask, including
+			# 802.11s mesh.  Stock Gale steered by radio, never by
+			# interface role, and pinning the mesh backhaul to CPU0
+			# would stack it on top of the Ethernet IRQs and the
+			# 2.4 GHz radio's interrupt work.
 			iface_mask="$mask"
-			iface_type="$(/usr/sbin/iw dev "${net_path##*/}" info \
-				2>/dev/null | sed -n 's/^[[:space:]]*type //p')"
-			# Gale assigns true 802.11s mesh interfaces to CPU0 for RPS,
-			# independently of the base radio's RPS mask.
-			[ "$iface_type" = "mesh point" ] && iface_mask=1
 
 			for device_path in "$net_path"/queues/rx-*; do
 				write_value "$device_path/rps_cpus" "$iface_mask"

@@ -1,0 +1,62 @@
+#!/bin/sh /etc/rc.common
+# Wireless QoS tuning ported from Google WiFi (Gale) ap-wireless-qos.conf,
+# using the values the OEM applies when its Stadia/QoS features are enabled.
+#
+# Requires the mac80211 per-TID CoDel patch
+# (395-wifi-mac80211-add-per-TID-CoDel-target-interval-cont.patch) for the
+# fq_target/fq_interval writes; every write degrades silently on kernels
+# without it.
+#
+# Not ported (OEM-only ath10k debugfs, no mainline equivalent yet):
+# atf_enable, atf_param (quantum/txq_limit/release_limit), burst_dur.
+
+START=99
+USE_PROCD=1
+
+apply_phy() {
+	local dbgfs="$1"
+	local phy="${dbgfs##*/}"
+	local aqm="$dbgfs/aqm"
+	local aggr="$dbgfs/ath10k/htt_max_amsdu_ampdu"
+	local tid
+
+	[ -e "$dbgfs/ath10k" ] || return 0
+
+	# OEM AQM tuning: 25ms CoDel target / 150ms interval on all TIDs
+	# except TID 5 (video), which runs 60ms/300ms to absorb bursty
+	# high-rate streams without CoDel overreacting.
+	if [ -w "$aqm" ]; then
+		for tid in 0 1 2 3 4 6 7; do
+			echo "fq_target $tid 25000" > "$aqm" 2>/dev/null
+			echo "fq_interval $tid 150000" > "$aqm" 2>/dev/null
+		done
+		echo "fq_target 5 60000" > "$aqm" 2>/dev/null
+		echo "fq_interval 5 300000" > "$aqm" 2>/dev/null
+	fi
+
+	# OEM MAC-layer tuning: cap aggregation at 1 A-MSDU / 32 A-MPDU to
+	# bound per-station airtime bursts (stock default is 3/64).
+	[ -w "$aggr" ] && echo "1 32" > "$aggr" 2>/dev/null
+
+	# OEM enables RTS/CTS protection for all data frames
+	# (ath10k rts_threshold=1 in the stock firmware).
+	iw phy "$phy" set rts 1 2>/dev/null
+}
+
+start_service() {
+	local dbgfs
+
+	[ "$(board_name)" = "google,wifi" ] || return 0
+
+	for dbgfs in /sys/kernel/debug/ieee80211/phy*; do
+		[ -d "$dbgfs" ] && apply_phy "$dbgfs"
+	done
+}
+
+reload_service() {
+	start_service
+}
+
+service_triggers() {
+	procd_add_reload_trigger "wireless"
+}

@@ -1,0 +1,138 @@
+From: OpenWrt community port of Google WiFi (Gale) OEM behavior
+Subject: [PATCH] wifi: mac80211: add per-TID CoDel target/interval controls
+
+The Google WiFi (Gale) 3.18 kernel carries a mac80211 change that turns
+the single fq-codel parameter set into one parameter set per QoS TID and
+exposes both knobs through the per-phy "aqm" debugfs file:
+
+  echo "fq_target <tid> <usec>"   > /sys/kernel/debug/ieee80211/phyX/aqm
+  echo "fq_interval <tid> <usec>" > /sys/kernel/debug/ieee80211/phyX/aqm
+
+The OEM userland (ap-wireless-qos.conf) relies on this to run TID 5
+(video) with a longer 60ms/300ms target/interval while the other TIDs
+get 25ms/150ms, trading a little video-queue latency for fewer CoDel
+drops on bursty high-rate streams.
+
+Implement the same interface: local->cparams becomes an 8-entry array
+indexed by "tid & 7" (the vif TXQ, tid 16, maps to the BE entry), the
+defaults are unchanged (20ms/100ms, ECN on), and the aqm debugfs file
+learns the OEM read/write syntax.  Behavior is identical to mainline
+until somebody writes to the new knobs.
+
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1413,7 +1413,11 @@ struct ieee80211_local {
+
+ 	struct fq fq;
+ 	struct codel_vars *cvars;
+-	struct codel_params cparams;
++	/*
++	 * One CoDel parameter set per QoS TID, runtime-tunable through
++	 * the phy "aqm" debugfs file.  Indexed by (tid & 7).
++	 */
++	struct codel_params cparams[8];
+
+ 	/* protects active_txqs and txqi->schedule_order */
+ 	spinlock_t active_txq_lock[IEEE80211_NUM_ACS];
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1405,7 +1405,7 @@ static struct sk_buff *fq_tin_dequeue_fu
+
+ 	local = container_of(fq, struct ieee80211_local, fq);
+ 	txqi = container_of(tin, struct txq_info, tin);
+-	cparams = &local->cparams;
++	cparams = &local->cparams[txqi->txq.tid & 7];
+ 	cstats = &txqi->cstats;
+
+ 	if (flow == &tin->default_flow)
+@@ -1602,10 +1602,12 @@ int ieee80211_txq_setup_flows(struct iee
+ 	if (!supp_vht)
+ 		fq->memory_limit = 4 << 20; /* 4 Mbytes */
+
+-	codel_params_init(&local->cparams);
+-	local->cparams.interval = MS2TIME(100);
+-	local->cparams.target = MS2TIME(20);
+-	local->cparams.ecn = true;
++	for (i = 0; i < ARRAY_SIZE(local->cparams); i++) {
++		codel_params_init(&local->cparams[i]);
++		local->cparams[i].interval = MS2TIME(100);
++		local->cparams[i].target = MS2TIME(20);
++		local->cparams[i].ecn = true;
++	}
+
+ 	local->cvars = kvcalloc(fq->flows_cnt, sizeof(local->cvars[0]),
+ 				GFP_KERNEL);
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -16,6 +16,9 @@
+
+ #define DEBUGFS_FORMAT_BUFFER_SIZE 100
+
++/* microseconds to codel_time_t (nanoseconds >> CODEL_SHIFT) */
++#define US2TIME(a) ((u32)(((u64)(a) * NSEC_PER_USEC) >> CODEL_SHIFT))
++
+ int mac80211_format_buffer(char __user *userbuf, size_t count,
+ 				  loff_t *ppos, char *fmt, ...)
+ {
+@@ -78,7 +81,7 @@ static ssize_t aqm_read(struct file *fil
+ {
+ 	struct ieee80211_local *local = file->private_data;
+ 	struct fq *fq = &local->fq;
+-	char buf[200];
++	char buf[400];
+ 	int len = 0;
+
+ 	spin_lock_bh(&local->fq.lock);
+@@ -103,6 +106,26 @@ static ssize_t aqm_read(struct file *fil
+ 			fq->limit,
+ 			fq->quantum);
+
++	len += scnprintf(buf + len, sizeof(buf) - len,
++			 "RW fq_target %u, %u, %u, %u, %u, %u, %u, %u\n"
++			 "RW fq_interval %u, %u, %u, %u, %u, %u, %u, %u\n",
++			 codel_time_to_us(local->cparams[0].target),
++			 codel_time_to_us(local->cparams[1].target),
++			 codel_time_to_us(local->cparams[2].target),
++			 codel_time_to_us(local->cparams[3].target),
++			 codel_time_to_us(local->cparams[4].target),
++			 codel_time_to_us(local->cparams[5].target),
++			 codel_time_to_us(local->cparams[6].target),
++			 codel_time_to_us(local->cparams[7].target),
++			 codel_time_to_us(local->cparams[0].interval),
++			 codel_time_to_us(local->cparams[1].interval),
++			 codel_time_to_us(local->cparams[2].interval),
++			 codel_time_to_us(local->cparams[3].interval),
++			 codel_time_to_us(local->cparams[4].interval),
++			 codel_time_to_us(local->cparams[5].interval),
++			 codel_time_to_us(local->cparams[6].interval),
++			 codel_time_to_us(local->cparams[7].interval));
++
+ 	spin_unlock_bh(&local->fq.lock);
+
+ 	return simple_read_from_buffer(user_buf, count, ppos,
+@@ -116,6 +139,7 @@ static ssize_t aqm_write(struct file *fi
+ {
+ 	struct ieee80211_local *local = file->private_data;
+ 	char buf[100];
++	u32 tid, val;
+
+ 	if (count >= sizeof(buf))
+ 		return -EINVAL;
+@@ -134,6 +158,17 @@ static ssize_t aqm_write(struct file *fi
+ 		return count;
+ 	else if (sscanf(buf, "fq_quantum %u", &local->fq.quantum) == 1)
+ 		return count;
++	else if (sscanf(buf, "fq_target %u %u", &tid, &val) == 2) {
++		if (tid >= ARRAY_SIZE(local->cparams))
++			return -EINVAL;
++		local->cparams[tid].target = US2TIME(val);
++		return count;
++	} else if (sscanf(buf, "fq_interval %u %u", &tid, &val) == 2) {
++		if (tid >= ARRAY_SIZE(local->cparams))
++			return -EINVAL;
++		local->cparams[tid].interval = US2TIME(val);
++		return count;
++	}
+
+ 	return -EINVAL;
+ }
