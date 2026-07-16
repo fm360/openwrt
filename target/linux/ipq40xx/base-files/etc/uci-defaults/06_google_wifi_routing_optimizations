@@ -18,6 +18,29 @@ uci -q get network.globals.packet_steering >/dev/null || \
 	uci -q set network.globals='globals'
 uci -q set network.globals.packet_steering='1'
 uci -q set network.globals.steering_flows='256'
+
+# Stock Gale keeps multi-AP topologies with mixed wired and wireless
+# backhaul loop-free with plain 802.1D STP on br-lan, orchestrated by
+# ap-monitor's StpPlugin.  The timers follow the OEM go/js-stp derivation
+# in gwifi_init.sh (forward delay 3s, max age 6s), sized for a ~3 hop
+# home mesh - do not reuse them for larger bridged networks.  The
+# root-bridge priority override belongs on the gateway node only, so it
+# is intentionally not set here (OEM elects the root at "groot" runtime).
+brlan_section=""
+find_brlan_device() {
+	local name
+	config_get name "$1" name
+	[ "$name" = "br-lan" ] && brlan_section="$1"
+}
+config_load network
+config_foreach find_brlan_device device
+if [ -n "$brlan_section" ]; then
+	uci -q set "network.$brlan_section.stp=1"
+	uci -q set "network.$brlan_section.forward_delay=3"
+	uci -q set "network.$brlan_section.max_age=6"
+	uci -q set "network.$brlan_section.hello_time=2"
+fi
+
 uci -q commit network
 
 exit 0
