@@ -1,0 +1,182 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+BRIDGE="br-lan"
+POLL_INTERVAL=10
+
+is_gale()
+{
+	[ "$(board_name)" = "google,wifi" ]
+}
+
+write_if_changed()
+{
+	local current label="$3" path="$1" value="$2"
+
+	[ -w "$path" ] || return 0
+	read -r current < "$path"
+	[ "$current" = "$value" ] && return 0
+
+	printf '%s\n' "$value" > "$path" || return 1
+	logger -t gale-stp-policy "$label: $current -> $value"
+}
+
+is_mesh_interface()
+{
+	iw dev "$1" info 2>/dev/null |
+		grep -q '^[[:space:]]*type mesh point$'
+}
+
+interface_band()
+{
+	local device_path frequency interface="$1"
+
+	device_path="$(readlink -f "/sys/class/net/$interface/phy80211/device" \
+		2>/dev/null)"
+	case "$device_path" in
+		*/a000000.wifi) echo 2; return 0 ;;
+		*/a800000.wifi) echo 5; return 0 ;;
+	esac
+
+	frequency="$(iw dev "$interface" info 2>/dev/null |
+		awk '/channel [0-9]+ \(/ {
+			gsub(/[()]/, "", $3)
+			print $3
+			exit
+		}')"
+	case "$frequency" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	if [ "$frequency" -ge 4900 ]; then
+		echo 5
+	else
+		echo 2
+	fi
+}
+
+apply_port_priorities()
+{
+	local band interface path priority
+
+	for path in "/sys/class/net/$BRIDGE/brif/"*; do
+		[ -e "$path" ] || continue
+		interface="${path##*/}"
+		is_mesh_interface "$interface" || continue
+		band="$(interface_band "$interface")" || continue
+
+		# The OEM creates mesh-5000mhz before mesh-2400mhz.  Both have
+		# equal STP cost and default port priority, so 5 GHz wins the
+		# final port-ID tie.  netifd normally creates Gale's 2.4 GHz
+		# interface first.  Keep the default priority (32) for 5 GHz
+		# and wired ports, and put only the 2.4 GHz fallback one class
+		# later.  This recreates the OEM ordering without relying on
+		# unstable interface creation order.
+		case "$band" in
+		5) priority=32 ;;
+		2) priority=48 ;;
+		*) continue ;;
+		esac
+
+		write_if_changed "$path/priority" "$priority" \
+			"$interface STP port priority"
+	done
+}
+
+count_high_band_peers()
+{
+	local band interface path
+
+	for path in "/sys/class/net/$BRIDGE/brif/"*; do
+		[ -e "$path" ] || continue
+		interface="${path##*/}"
+		is_mesh_interface "$interface" || continue
+		band="$(interface_band "$interface")" || continue
+		[ "$band" = 5 ] || continue
+
+		iw dev "$interface" station dump 2>/dev/null
+	done |
+		awk '$1 == "Station" { print tolower($2) }' |
+		sort -u |
+		awk 'NF { count++ } END { print count + 0 }'
+}
+
+inspect_mesh_root()
+{
+	local gate mode rootmode section="$1"
+
+	config_get mode "$section" mode
+	[ "$mode" = "mesh" ] || return 0
+
+	config_get rootmode "$section" mesh_hwmp_rootmode 0
+	config_get gate "$section" mesh_gate_announcements 0
+	case "$rootmode:$gate" in
+	0:0) ;;
+	*) mesh_root=1 ;;
+	esac
+}
+
+detect_mesh_root()
+{
+	mesh_root=0
+	config_load wireless
+	config_foreach inspect_mesh_root wifi-iface
+}
+
+apply_bridge_priority()
+{
+	local base peer_count priority
+
+	[ -w "/sys/class/net/$BRIDGE/bridge/priority" ] || return 0
+
+	detect_mesh_root
+	peer_count="$(count_high_band_peers)"
+	case "$peer_count" in
+	''|*[!0-9]*) peer_count=0 ;;
+	esac
+
+	# ap-monitor StpPlugin writes:
+	#   (root_node ? 0x7f00 : 0x8000) - (mesh_peer_count << 9)
+	# The peer set intentionally excludes mesh-2400mhz.  Cap the count
+	# before arithmetic so corrupted station output cannot underflow
+	# the 16-bit bridge priority.
+	[ "$peer_count" -le 63 ] || peer_count=63
+	if [ "$mesh_root" -eq 1 ]; then
+		base=32512
+	else
+		base=32768
+	fi
+	priority=$((base - peer_count * 512))
+	[ "$priority" -ge 0 ] || priority=0
+
+	write_if_changed "/sys/class/net/$BRIDGE/bridge/priority" "$priority" \
+		"$BRIDGE STP bridge priority ($peer_count high-band peers)"
+}
+
+apply_policy()
+{
+	is_gale || return 0
+	[ -d "/sys/class/net/$BRIDGE/brif" ] || return 0
+
+	apply_port_priorities
+	apply_bridge_priority
+}
+
+case "$1" in
+apply)
+	apply_policy
+	;;
+daemon)
+	trap 'exit 0' INT TERM
+	while :; do
+		apply_policy
+		sleep "$POLL_INTERVAL"
+	done
+	;;
+*)
+	echo "Usage: $0 {apply|daemon}" >&2
+	exit 1
+	;;
+esac

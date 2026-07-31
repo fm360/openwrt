@@ -24,8 +24,9 @@ uci -q set network.globals.steering_flows='256'
 # ap-monitor's StpPlugin.  The timers follow the OEM go/js-stp derivation
 # in gwifi_init.sh (forward delay 3s, max age 6s), sized for a ~3 hop
 # home mesh - do not reuse them for larger bridged networks.  The
-# root-bridge priority override belongs on the gateway node only, so it
-# is intentionally not set here (OEM elects the root at "groot" runtime).
+# The runtime gale-stp-policy service below supplies ap-monitor's missing
+# root-election policy and preserves the OEM 5 GHz-before-2.4 GHz STP
+# tie-break independently of netifd's wireless interface creation order.
 brlan_section=""
 find_brlan_device() {
 	local name
@@ -42,5 +43,7 @@ if [ -n "$brlan_section" ]; then
 fi
 
 uci -q commit network
+
+/etc/init.d/gale-stp-policy enable
 
 exit 0

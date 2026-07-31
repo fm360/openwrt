@@ -1,0 +1,13 @@
+#!/bin/sh
+
+case "$ACTION" in
+add|move|online) ;;
+*) exit 0 ;;
+esac
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = "google,wifi" ] || exit 0
+
+/usr/libexec/gale-stp-policy apply

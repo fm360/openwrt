@@ -137,6 +137,50 @@ The EDMA interrupt moderation register uses two-microsecond ticks. Stock
 defaults are 64 microseconds for RX (`0x20`) and 160 microseconds for TX
 (`0x50`).
 
+## Stock dual-band mesh and STP policy
+
+Gale does not use batman-adv, bonding, or a proprietary kernel multipath
+driver. The extracted root filesystem contains ordinary `bridge.ko`, `stp.ko`,
+and `mac80211.ko`, but no batman, bonding, or team module. Its mesh setup does
+the following:
+
+- creates `mesh-5000mhz` first and `mesh-2400mhz` second;
+- adds both standard 802.11s interfaces directly to `br-lan`;
+- enables HWMP root mode 3 and gate announcements only on the configured root;
+- uses Linux 802.1D STP to remove the resulting L2 loops.
+
+The stripped OEM `ap-monitor` binary (SHA-256
+`27053a47c0de9df2a11e02a688f7886df802f0812bd77bb4cc952474cdf00611`)
+retains the source path `ap-daemons/monitor/stp_plugin.cc`. IDA analysis of
+that component shows that `StpPlugin`:
+
+- reads `bridge/stp_state` and each candidate's `brport/state`;
+- keeps a set of peers from high-band mesh interfaces, deliberately excluding
+  `mesh-2400mhz`;
+- writes bridge priority as
+  `(root_node ? 0x7f00 : 0x8000) - (unique_high_band_peers << 9)`;
+- records one upstream backhaul port;
+- resolves that port through the bridge FDB/root MAC if multiple ports are in
+  forwarding state.
+
+This is active-tree selection and failover, not packet striping. Other mesh
+ports may forward toward children elsewhere in the tree, so both bands can
+carry traffic across a whole topology, but a node does not aggregate two
+parallel upstream links for the same bridged flow.
+
+With equal wireless STP costs, creating 5 GHz first gives it the lower bridge
+port ID and wins the final STP tie. OpenWrt normally creates Gale's 2.4 GHz
+radio first. The `gale-stp-policy` service makes that implicit OEM ordering
+explicit: wired and 5 GHz ports retain priority 32 while the 2.4 GHz fallback
+uses priority 48. It also reproduces the OEM peer-count bridge-priority formula
+and updates it as peers change.
+
+A live OpenWrt capture confirmed the intended wired-AP case: Ethernet was the
+forwarding root path at cost 5, both mesh ports were blocked at cost 100, and
+both radios still had three established peers with no TX failures. Empty or
+nearly empty HWMP/data counters on those blocked mesh ports are expected and
+do not indicate a 5 GHz driver failure.
+
 ## Existing OpenWrt implementation
 
 This clone uses Linux 6.18.38 and already has a modern IPQESS plus QCA8K DSA
@@ -164,6 +208,7 @@ disabled.
 | Patch 724 exact RSS table | `gale-platform.conf` raw RSS patterns | Direct policy port via DT |
 | nftables flow offload | `shortcut-fe*.ko` and `traffic-acceleration.conf` | Maintained functional substitute for SFE |
 | Shared-master RPS masks | Separate OEM LAN/WAN masks in `gale-platform.conf` | DSA topology adaptation |
+| `gale-stp-policy` | `ap-mesh.conf` ordering and IDA-recovered `StpPlugin` policy | Direct policy port plus deterministic netifd adaptation |
 
 ### Kernel patch 720: configurable interrupt moderation
 
